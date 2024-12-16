@@ -5,6 +5,7 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <concepts>
 #include <type_traits>
 #include <thread>
 #include <tuple>
@@ -14,84 +15,6 @@ sync_logger g_sync_logger(std::cout);
 
 namespace details {
 
-constexpr std::size_t max_inplace_cb_size = sizeof(void*) * 2;
-
-struct cb_storage {
-    // A user-provided callback whatever it can be is either something which has
-    // reasonably small size and usual alignment, or else an additional
-    // heap-allocated storage is needed for it.
-    union s {
-        void* m_ptr;
-        char  m_obj[max_inplace_cb_size];
-    } m_data;
-
-    void (*m_dtor)(cb_storage&) = nullptr;
-
-    // Actually a translator prototype is a function accepting a number of
-    // so far unknown arguments. But a language standard allows to reinterpret
-    // cast function pointer into another prototype assuming that it will be
-    // cast back before using.
-    void (*m_translator)() = nullptr;
-
-    cb_storage() = default;
-    cb_storage(const cb_storage&) = delete;
-
-    ~cb_storage() {
-        if (m_dtor)
-            (*m_dtor)(*this);
-    }
-};
-
-template <class T>
-struct is_inplace {
-    static constexpr bool value = sizeof(T) <= max_inplace_cb_size
-        && alignof(T) <= alignof(void*);
-};
-
-template <bool>
-struct cb_storage_ops {
-    template <class T, class ... Args>
-    static void init(cb_storage& s, T&& t) {
-        typedef std::decay_t<T> T1;
-        s.m_data.m_ptr = new T1(std::forward<T>(t));
-        s.m_dtor = &dtor<T1>;
-        s.m_translator = reinterpret_cast<void (*)()>(&translator<T1, Args ...>);
-    }
-
-    template <class T>
-    static void dtor(cb_storage& s) {
-        delete static_cast<T*>(s.m_data.m_ptr);
-    }
-
-    template <class T, class ... Args>
-    static void translator(cb_storage& s, std::tuple<Args ...> args) {
-        std::apply(*static_cast<T*>(s.m_data.m_ptr), std::move(args));
-    }
-};
-
-template <>
-struct cb_storage_ops<true> {
-    template <class T, class ... Args>
-    static void init(cb_storage& s, T&& t) {
-        typedef std::decay_t<T> T1;
-        new (s.m_data.m_obj) T1(std::forward<T>(t));
-        s.m_dtor = &dtor<T1>;
-        s.m_translator = reinterpret_cast<void (*)()>(&translator<T1, Args ...>);
-    }
-
-    template <class T>
-    static void dtor(cb_storage& s) {
-        std::launder(reinterpret_cast<T*>(s.m_data.m_obj))
-            ->T::~T();
-    }
-
-    template <class T, class ... Args>
-    static void translator(cb_storage& s, std::tuple<Args ...> args) {
-        T* f = std::launder(reinterpret_cast<T*>(s.m_data.m_obj));
-        std::apply(*f, std::move(args));
-    }
-};
-
 class notifier_base {
 public:
     typedef int sub_id_t;
@@ -100,7 +23,7 @@ protected:
     ~notifier_base() = default;
 
     struct subscription {
-        cb_storage m_cb_storage;
+        std::function<void(void*)> m_translator;
         const sub_id_t m_id;
         // ids of threads which currently execute this subscription's callback
         std::vector<std::thread::id> m_active_cycle_threads;
@@ -151,7 +74,7 @@ protected:
         return false;
     }
 
-    void notify(void (*ptr)(void*, cb_storage&), void* ctx) {
+    void notify(void* ctx) {
         std::list<subscription> garbage;
         std::unique_lock l{m_list_mtx};
 
@@ -170,7 +93,7 @@ protected:
             l.unlock();
 
             try {
-                (*ptr)(ctx, it->m_cb_storage);
+                it->m_translator(ctx);
             } catch (...) {
             }
 
@@ -217,13 +140,14 @@ public:
     // design such is that comparing arbitrary function objects is not
     // supported.
     template <class F>
+    requires std::invocable<F, Args...>
     sub_id_t subscribe(F&& cb) {
-        typedef std::decay_t<F> F1;
-        const bool is_inp = details::is_inplace<F1>::value;
-        typedef details::cb_storage_ops<is_inp> ops_t;
-
+        using args_t = std::tuple<Args...>;
+        
         auto [s, l, id] = notifier_base::subscribe();
-        ops_t::template init<F, Args...>(s.m_cb_storage, std::forward<F>(cb));
+        s.m_translator = [inner = std::forward<F>(cb)](void* ctx) {
+            std::apply(inner, *static_cast<args_t*>(ctx));
+        };
         return id;
     }
 
@@ -242,30 +166,8 @@ public:
     // iteration/manipulation.
     template <class ... ArgsI>
     void notify(ArgsI&& ... args) {
-        auto args_tuple = std::make_tuple(std::forward<ArgsI>(args) ...);
-
-        struct inner {
-            decltype(args_tuple) m_args;
-
-            inner(decltype(args_tuple)&& args) : m_args(std::move(args))
-            {}
-
-            static void call(void* ctx, details::cb_storage& s) {
-                auto ths = static_cast<inner*>(ctx);
-                auto tr = reinterpret_cast<
-                    void(*)(details::cb_storage&, std::tuple<Args...>)>(s.m_translator);
-
-                // This class's field "m_args" - is a final destination place of
-                // input arguments' move-chain. They can't be moved further into
-                // a translator call because there is more than one subscriber
-                // in general and consequently more than one translator call -
-                // the arguments need to be copied for each translator
-                // invokation.
-                (*tr)(s, ths->m_args);
-            }
-        } i{std::move(args_tuple)};
-
-        notifier_base::notify(&inner::call, &i);
+        std::tuple<Args...> args_tuple (std::forward<ArgsI>(args) ...);
+        notifier_base::notify(&args_tuple);
     }
 
     using notifier_base::count;
